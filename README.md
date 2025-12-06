@@ -9,6 +9,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export OPENAI_API_KEY="sk-..."  # or create a .env file
+python - <<'PY'
+from app.services.db import init_db
+init_db()
+PY
 streamlit run app/main.py
 ```
 
@@ -16,9 +20,11 @@ streamlit run app/main.py
 
 - `app/main.py` – Streamlit entrypoint with chat UI + phase/status view.
 - `app/state.py` – Session state model + phase machine helpers.
-- `app/agents/` – LangChain tools and master orchestrator.
+- `app/agents/` – LangChain tools and master orchestrator (sales, KYC, underwriting, sanction).
+- `app/services/db.py` – Lightweight SQLite wrapper + seed data.
+- `app/services/products.py` – Product recommendation queries.
 - `app/services/` – Reserved for mock KYC, underwriting, and PDF helpers.
 - `data/` – Mock databases / fixtures.
 - `artifacts/` – Generated assets like sanction letters.
 
-We will expand each module in the upcoming steps (sales agent, KYC, underwriting, sanction letter generation, and final polish).
+The Sales agent parses user intents via the LLM, queries the SQLite catalog, and captures structured loan requests. The KYC agent now validates PAN/DOB/phone against the same DB with LangChain structured extraction. Next steps will wire real underwriting and sanction logic.
