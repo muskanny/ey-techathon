@@ -75,7 +75,7 @@ def init_db() -> None:
     if cur.fetchone()[0] == 0:
         sample_products = [
             ("Flexi Personal Loan", "travel", 50000, 1000000, 12.5, 48, "Ideal for vacations and experiences."),
-            ("Smart Home Loan", "home_improvement", 100000, 2500000, 11.9, 60, "Renovations, furnishings, interiors."),
+            ("Smart Home Loan", "home", 100000, 2500000, 11.9, 60, "Renovations, furnishings, interiors."),
             ("Education Achiever", "education", 50000, 1500000, 10.5, 72, "Higher studies and certifications."),
             ("Medical Relief", "medical", 25000, 800000, 13.2, 36, "Emergency medical funding."),
         ]

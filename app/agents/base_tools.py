@@ -1,13 +1,16 @@
 from __future__ import annotations
-
 import re
-from typing import Dict, Optional
 
-from langchain.tools import Tool
-from langchain_core.pydantic_v1 import BaseModel, Field
+from typing import Dict, Optional
+from datetime import datetime
+
+from langchain_core.tools import Tool
+
+from pydantic import BaseModel, Field # <--- CORRECT
 
 from app.services.products import recommend_product
 from app.services.kyc import verify_customer
+from app.services.underwriting import perform_eligibility_check
 from app.state import LoanSession, Phase
 
 
@@ -74,13 +77,24 @@ def _kyc_tool(user_input: str, session: LoanSession, llm) -> Dict[str, str]:
 
     result = verify_customer(payload.pan, payload.dob, payload.phone)
     if result.get("verified"):
+        
+        # --- START OF MODIFICATION ---
+        customer_data = result.get("customer", {})
+        
+        # CRITICAL FIX: Explicitly remove the 'income' key from the fetched customer data.
+        # This prevents the verified income from being stored in the session.customer_profile.
+        if "income" in customer_data:
+            del customer_data["income"] 
+            
         session.customer_profile = {
             "pan": payload.pan,
             "dob": payload.dob,
             "phone": payload.phone,
-            "customer": result.get("customer"),
+            "customer": customer_data, # Use the cleaned customer_data without income
             "verified": True,
         }
+        # --- END OF MODIFICATION ---
+        
         session.advance_phase(Phase.UNDERWRITING)
         message = (
             f"KYC verification successful for PAN {payload.pan}. "
@@ -100,7 +114,6 @@ def _kyc_tool(user_input: str, session: LoanSession, llm) -> Dict[str, str]:
         )
     return {"assistant_message": message}
 
-
 def _regex_parse_kyc(user_input: str) -> Optional[KycPayload]:
     pan_match = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", user_input.upper())
     dob_match = re.search(r"(\d{4}-\d{2}-\d{2})", user_input)
@@ -115,16 +128,125 @@ def _regex_parse_kyc(user_input: str) -> Optional[KycPayload]:
 
 
 def _underwriting_tool(user_input: str, session: LoanSession) -> Dict[str, str]:
-    session.underwriting_result = {"status": "pending", "notes": user_input}
-    session.advance_phase(Phase.SANCTION)
-    return {"assistant_message": "Underwriting stub finished. Preparing sanction letter."}
+    
+    # -----------------------------------------------------------
+    # STEP 1: CONDITIONAL INCOME COLLECTION
+    # Check if income is missing from the loan request (it should be, since the user didn't provide it initially)
+    # -----------------------------------------------------------
+    if session.loan_request.get("income") is None:
+        
+        # Try to parse income from the user's current message
+        # This is a simplified regex; a real system would use the LLM to parse this reliably.
+        income_match = re.search(r"(\d+([.,]\d+)?)\s*(lakh|lac|k|inr)", user_input, re.IGNORECASE)
+        
+        if income_match:
+            # Income provided now. Parse and store it in the loan_request.
+            amount_str = income_match.group(1).replace(",", "")
+            unit = income_match.group(3).lower()
+            
+            income_value = float(amount_str)
+            if unit in ["lakh", "lac"]:
+                income_value *= 100000
+            elif unit == "k":
+                income_value *= 1000
+                
+            # Update the loan request with the self-disclosed income
+            session.loan_request["income"] = income_value
+            # Now, the code falls through to STEP 2 (the eligibility check)
+            
+        else:
+            # Income is still missing and the user didn't provide it in this turn.
+            # Ask the user and stop the tool execution.
+            return {
+                "assistant_message": (
+                    "Thank you for the verification. To proceed with the eligibility check, "
+                    "please provide your **annual income** in INR (e.g., '15 lakhs' or '800000')."
+                )
+            }
+            # Phase remains UNDERWRITING, which ensures this tool is run again next time.
+    
+    # -----------------------------------------------------------
+    # STEP 2: RUN ELIGIBILITY CHECK (Only reached if income is now present)
+    # -----------------------------------------------------------
+    result = perform_eligibility_check(session) # This now uses session.loan_request["income"]
+    
+    session.underwriting_result = {
+        "status": result["status"], 
+        "notes": result["reason"],
+        "approved_amount": result["approved_amount"],
+    }
 
+    if result["status"] == "APPROVED":
+        session.advance_phase(Phase.SANCTION)
+        message = (
+            f"**Eligibility Check Complete:** Your loan is Approved for INR {result['approved_amount']:,.0f}. "
+            "Proceeding to prepare your sanction letter."
+        )
+    else:
+        # Stop the process if rejected
+        session.advance_phase(Phase.COMPLETED) 
+        message = (
+            f"**Application Rejected:** {result['reason']} "
+            "We cannot proceed with the loan at this time."
+        )
+    
+    return {"assistant_message": message}
 
 def _sanction_tool(user_input: str, session: LoanSession) -> Dict[str, str]:
-    session.sanction_letter = {"path": "artifacts/demo.pdf"}
-    session.advance_phase(Phase.COMPLETED)
-    return {"assistant_message": "Sanction letter will be ready shortly."}
+    # --- Data Retrieval ---
+    loan_data = session.loan_request
+    product = loan_data["recommended_product"]
+    approved_amount = session.underwriting_result.get("approved_amount", loan_data["loan_amount"])
+    customer_name = session.customer_profile["customer"].get("name", "Valued Customer")
+    pan_id = session.customer_profile["pan"]
+    
+    sanction_path = f"artifacts/{customer_name.replace(' ', '_')}_Sanction_Letter.pdf" 
+    
+    # --- Generate Letter Content ---
+    letter_content = f"""
+### Sanction Letter - Loan Approval
+**Reference No:** LSA-{pan_id[:5]}-2025
 
+**Date:** {datetime.now().strftime("%B %d, %Y")}
+
+**Applicant:** {customer_name}
+**PAN:** {pan_id}
+
+---
+
+Dear {customer_name},
+
+We are pleased to inform you that your loan application has been **APPROVED**. This sanction letter outlines the key terms of your agreement:
+
+| Parameter | Details |
+| :--- | :--- |
+| **Product** | {product['name']} |
+| **Sanctioned Amount** | **INR {approved_amount:,.0f}** |
+| **Purpose** | {loan_data['purpose'].title()} |
+| **Interest Rate** | {product['interest_rate']}% p.a. (Fixed) |
+| **Tenure** | {product['tenure_months']} Months |
+
+**Terms and Conditions:**
+1. The sanctioned amount is subject to final document verification.
+2. Disbursal will be made within 3 business days of signing the agreement.
+
+Thank you for choosing us.
+
+Sincerely,
+The Loans Team
+"""
+    
+    session.sanction_letter = {
+        "path": sanction_path,
+        "content": letter_content, # <-- NEW: Store the generated Markdown text
+    }
+    session.advance_phase(Phase.COMPLETED)
+    
+    message = (
+        "**Congratulations!** Your sanction letter has been successfully generated. "
+        "Please review the document below and use the link to download the final PDF."
+    )
+    return {"assistant_message": message}
 
 def create_sales_agent(llm, session: LoanSession) -> Tool:
     return Tool(
